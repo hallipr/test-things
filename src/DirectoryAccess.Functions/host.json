@@ -1,6 +1,15 @@
 {
   "version": "2.0",
   "logging": {
-    "logLevel": { "default": "Warning", "Host.Results": "Warning", "Function": "Warning" }
+    "logLevel": {
+      "default": "Warning",
+      "Host.Results": "Information",
+      "Host.Aggregator": "Information",
+      "Function": "Information",
+      "DirectoryAccess.Functions": "Information"
+    },
+    "applicationInsights": {
+      "samplingSettings": { "isEnabled": false }
+    }
   }
 }

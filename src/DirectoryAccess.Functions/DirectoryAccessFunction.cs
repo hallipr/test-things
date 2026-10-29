@@ -1,4 +1,5 @@
 using System.Net;
+using System.Diagnostics;
 using Azure;
 using Azure.Identity;
 using Microsoft.Azure.Functions.Worker;
@@ -17,6 +18,12 @@ public sealed class DirectoryAccessFunction(DirectoryAccessBroker broker, ILogge
     {
         // The trigger is anonymous only at the Functions key layer. Workload JWT
         // validation and the operator-written invocation mapping are mandatory.
+        using var scope = logger.BeginScope(new Dictionary<string, object>
+        {
+            ["FunctionInvocationId"] = request.FunctionContext.InvocationId
+        });
+        var elapsed = Stopwatch.StartNew();
+        logger.LogInformation("Directory access HTTP request received; method {HttpMethod}", request.Method);
         var response = request.CreateResponse();
         response.Headers.Add("Cache-Control", "no-store");
         response.Headers.Add("Pragma", "no-cache");
@@ -33,19 +40,36 @@ public sealed class DirectoryAccessFunction(DirectoryAccessBroker broker, ILogge
             response.StatusCode = HttpStatusCode.OK;
             await response.WriteStringAsync(System.Text.Json.JsonSerializer.Serialize(grant,
                 new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)));
+            logger.LogInformation("Directory access response authorized; directory {DirectoryUrl}, expires {ExpiresOn}; credentials omitted from logs",
+                grant.DirectoryUrl, grant.ExpiresOn);
         }
         catch (InvalidTokenException) { await Error(response, HttpStatusCode.Unauthorized, "invalid_token"); }
         catch (ForbiddenException) { await Error(response, HttpStatusCode.Forbidden, "not_authorized"); }
         catch (UpstreamException) { await Error(response, HttpStatusCode.ServiceUnavailable, "identity_or_storage_unavailable"); }
         catch (RequestFailedException ex)
         {
+            logger.LogError("Azure Storage request failed; storage HTTP {StorageStatus}, error {StorageErrorCode}", ex.Status, ex.ErrorCode);
             var status = ex.Status is 408 or 429 or >= 500 or 0
                 ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.BadGateway;
             await Error(response, status, "storage_failure");
         }
-        catch (HttpRequestException) { await Error(response, HttpStatusCode.ServiceUnavailable, "upstream_unavailable"); }
-        catch (AuthenticationFailedException) { await Error(response, HttpStatusCode.ServiceUnavailable, "storage_identity_unavailable"); }
-        catch (IOException) { await Error(response, HttpStatusCode.ServiceUnavailable, "storage_read_failure"); }
+        catch (HttpRequestException ex)
+        {
+            logger.LogError("Upstream HTTP request failed; status {UpstreamStatus}", ex.StatusCode);
+            await Error(response, HttpStatusCode.ServiceUnavailable, "upstream_unavailable");
+        }
+        catch (AuthenticationFailedException)
+        {
+            logger.LogError("Managed identity could not authenticate to Azure Storage");
+            await Error(response, HttpStatusCode.ServiceUnavailable, "storage_identity_unavailable");
+        }
+        catch (IOException)
+        {
+            logger.LogError("Azure Storage response stream could not be read");
+            await Error(response, HttpStatusCode.ServiceUnavailable, "storage_read_failure");
+        }
+        logger.LogInformation("Directory access HTTP request completed; status {HttpStatus}, duration milliseconds {DurationMs}",
+            (int)response.StatusCode, elapsed.ElapsedMilliseconds);
         return response;
     }
 

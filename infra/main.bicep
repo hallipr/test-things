@@ -13,6 +13,13 @@ param githubOidcAudience string = 'api://hallipr-test-things-directory-access'
 @description('Existing user-assigned managed identity in this resource group.')
 param managedIdentityName string = 'pahallis-sandbox-identity'
 
+@description('Optional existing Application Insights component in this resource group.')
+param applicationInsightsName string = ''
+
+resource applicationInsights 'Microsoft.Insights/components@2020-02-02' existing = if (!empty(applicationInsightsName)) {
+  name: applicationInsightsName
+}
+
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
   name: managedIdentityName
 }
@@ -129,6 +136,9 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         { name: 'AZURE_CLIENT_ID', value: brokerIdentity.properties.clientId }
         { name: 'GitHubOidcAudience', value: githubOidcAudience }
         { name: 'RunStorageAccountUrl', value: runStorage.properties.primaryEndpoints.dfs }
+        ...(!empty(applicationInsightsName) ? [
+          { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: applicationInsights!.properties.ConnectionString }
+        ] : [])
       ]
     }
   }

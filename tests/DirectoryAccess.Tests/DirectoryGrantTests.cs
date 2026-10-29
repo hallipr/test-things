@@ -6,22 +6,30 @@ using Azure.Storage.Files.DataLake;
 using Azure.Storage.Files.DataLake.Models;
 using Azure.Storage.Sas;
 using DirectoryAccess.Functions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace DirectoryAccess.Tests;
 
 public sealed class DirectoryGrantTests
 {
+    private readonly RecordingLogger<DirectoryAccessBroker> brokerLogs = new();
+
     [Fact]
     public async Task Broker_matches_trusted_mapping_and_issues_exact_sixty_minutes()
     {
         var store = new TestStore(true);
         var clock = new FixedClock();
-        var grant = await new DirectoryAccessBroker(new Validator(), store, clock).IssueAsync("signed-token", "1");
+        var grant = await new DirectoryAccessBroker(new Validator(), store, clock, brokerLogs).IssueAsync("signed-token", "1");
         Assert.Equal("1", store.Path);
         Assert.Equal(clock.GetUtcNow().ToUnixTimeSeconds(), grant.StartsOn.ToUnixTimeSeconds());
         Assert.Equal(0, grant.StartsOn.Ticks % TimeSpan.TicksPerSecond);
         Assert.Equal(TimeSpan.FromMinutes(60), grant.ExpiresOn - grant.StartsOn);
+        Assert.Contains(brokerLogs.Entries, e => e.Message.Contains("Invocation mapping vetting"));
+        Assert.Contains(brokerLogs.Entries, e => e.Message.Contains("Invocation authorization approved"));
+        Assert.DoesNotContain("signed-token", brokerLogs.Dump);
+        Assert.DoesNotContain(grant.SasToken, brokerLogs.Dump);
     }
 
     [Fact]
@@ -29,7 +37,7 @@ public sealed class DirectoryGrantTests
     {
         var store = new TestStore(false);
         await Assert.ThrowsAsync<ForbiddenException>(() =>
-            new DirectoryAccessBroker(new Validator(), store, new FixedClock()).IssueAsync("signed-token", "1"));
+            new DirectoryAccessBroker(new Validator(), store, new FixedClock(), brokerLogs).IssueAsync("signed-token", "1"));
         Assert.False(store.Signed);
     }
 
@@ -38,7 +46,7 @@ public sealed class DirectoryGrantTests
     {
         var store = new TestStore(true);
         await Assert.ThrowsAsync<InvalidTokenException>(() =>
-            new DirectoryAccessBroker(new Validator(false), store, new FixedClock()).IssueAsync("invalid", "1"));
+            new DirectoryAccessBroker(new Validator(false), store, new FixedClock(), brokerLogs).IssueAsync("invalid", "1"));
         Assert.Null(store.Path);
         Assert.False(store.Signed);
     }
@@ -82,7 +90,7 @@ public sealed class DirectoryGrantTests
     {
         var store = new TestStore(true);
         await Assert.ThrowsAsync<ForbiddenException>(() =>
-            new DirectoryAccessBroker(new Validator(), store, new FixedClock()).IssueAsync("valid", invocationId));
+            new DirectoryAccessBroker(new Validator(), store, new FixedClock(), brokerLogs).IssueAsync("valid", invocationId));
         Assert.Null(store.Path);
         Assert.False(store.Signed);
     }
@@ -92,7 +100,7 @@ public sealed class DirectoryGrantTests
     {
         var store = new TestStore(true, hasAuthorization: false);
         await Assert.ThrowsAsync<ForbiddenException>(() =>
-            new DirectoryAccessBroker(new Validator(), store, new FixedClock()).IssueAsync("valid", "1"));
+            new DirectoryAccessBroker(new Validator(), store, new FixedClock(), brokerLogs).IssueAsync("valid", "1"));
         Assert.False(store.Signed);
     }
 
@@ -107,8 +115,37 @@ public sealed class DirectoryGrantTests
         var authorization = new InvocationAuthorization(invocationId, new RunIdentity(repositoryId, runId, attempt));
         var store = new TestStore(true, authorization);
         await Assert.ThrowsAsync<ForbiddenException>(() =>
-            new DirectoryAccessBroker(new Validator(), store, new FixedClock()).IssueAsync("valid", "1"));
+            new DirectoryAccessBroker(new Validator(), store, new FixedClock(), brokerLogs).IssueAsync("valid", "1"));
         Assert.False(store.Signed);
+        Assert.Contains(brokerLogs.Entries, e => e.Level == LogLevel.Warning &&
+            e.Message.Contains("trusted mapping does not match"));
+    }
+
+    [Fact]
+    public async Task Sas_issuance_logs_url_scope_and_expiry_but_never_credentials()
+    {
+        var start = DateTimeOffset.FromUnixTimeSeconds(1800000000);
+        var end = start.AddMinutes(60);
+        var key = Convert.ToBase64String(Enumerable.Range(0, 32).Select(i => (byte)i).ToArray());
+        var xml = $"""
+            <UserDelegationKey>
+            <SignedOid>11111111-1111-1111-1111-111111111111</SignedOid>
+            <SignedTid>22222222-2222-2222-2222-222222222222</SignedTid>
+            <SignedStart>{start:yyyy-MM-ddTHH:mm:ssZ}</SignedStart>
+            <SignedExpiry>{end:yyyy-MM-ddTHH:mm:ssZ}</SignedExpiry>
+            <SignedService>b</SignedService><SignedVersion>2023-11-03</SignedVersion><Value>{key}</Value>
+            </UserDelegationKey>
+            """;
+        var logs = new RecordingLogger<AzureRunDirectoryStore>();
+        var grant = await Store(new StorageHandler(HttpStatusCode.OK, payload: xml, contentType: "application/xml"), logs)
+            .SignAsync("1", start, end, default);
+        Assert.Contains(grant.DirectoryUrl, logs.Dump);
+        Assert.Contains("Directory SAS issued", logs.Dump);
+        Assert.Contains("resource d, permissions rl", logs.Dump);
+        Assert.Contains(logs.Entries, e => e.Properties.TryGetValue("LifetimeSeconds", out var seconds) && Equals(seconds, 3600d));
+        Assert.DoesNotContain(key, logs.Dump);
+        Assert.DoesNotContain(grant.SasToken, logs.Dump);
+        Assert.DoesNotContain("sig=", logs.Dump);
     }
 
     [Fact]
@@ -170,15 +207,16 @@ public sealed class DirectoryGrantTests
         }
     }
 
-    private static AzureRunDirectoryStore Store(HttpMessageHandler handler)
+    private static AzureRunDirectoryStore Store(HttpMessageHandler handler, ILogger<AzureRunDirectoryStore>? logger = null)
     {
         var options = new DataLakeClientOptions { Transport = new HttpClientTransport(new HttpClient(handler)) };
         options.Retry.MaxRetries = 0;
         return new(new DataLakeServiceClient(new Uri("https://testaccount.dfs.core.windows.net"),
-            new TestCredential(), options));
+            new TestCredential(), options), logger ?? NullLogger<AzureRunDirectoryStore>.Instance);
     }
 
-    private sealed class StorageHandler(HttpStatusCode status, string? code = null, bool isDirectory = false, string? payload = null)
+    private sealed class StorageHandler(HttpStatusCode status, string? code = null, bool isDirectory = false,
+        string? payload = null, string? contentType = null)
         : HttpMessageHandler
     {
         public string? RequestPath { get; private set; }
@@ -188,7 +226,7 @@ public sealed class DirectoryGrantTests
             var response = new HttpResponseMessage(status)
             {
                 Content = new StringContent(payload ?? (code is null ? "" : $"<Error><Code>{code}</Code><Message>Test failure</Message></Error>"),
-                    System.Text.Encoding.UTF8, payload is null ? "application/xml" : "application/json")
+                    System.Text.Encoding.UTF8, contentType ?? (payload is null ? "application/xml" : "application/json"))
             };
             if (isDirectory) response.Headers.TryAddWithoutValidation("x-ms-meta-hdi_isfolder", "true");
             response.Headers.TryAddWithoutValidation("x-ms-request-id", "test-request");
@@ -238,7 +276,7 @@ public sealed class DirectoryGrantTests
             return Task.FromResult(new DirectoryGrant
             {
                 DirectoryUrl = "https://testaccount.dfs.core.windows.net/runs/" + path,
-                SasToken = "test", StartsOn = startsOn, ExpiresOn = expiresOn
+                SasToken = "sig=DO_NOT_LOG_GRANT_SECRET", StartsOn = startsOn, ExpiresOn = expiresOn
             });
         }
     }

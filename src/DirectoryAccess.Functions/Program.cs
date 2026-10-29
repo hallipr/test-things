@@ -1,8 +1,11 @@
 using Azure.Identity;
 using Azure.Storage.Files.DataLake;
 using DirectoryAccess.Functions;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.ApplicationInsights;
 
 var options = new BrokerOptions
 {
@@ -15,6 +18,8 @@ var host = new HostBuilder()
     .ConfigureFunctionsWorkerDefaults()
     .ConfigureServices(services =>
     {
+        services.AddApplicationInsightsTelemetryWorkerService(settings => settings.EnableAdaptiveSampling = false);
+        services.ConfigureFunctionsApplicationInsights();
         services.AddSingleton(options);
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton(GitHubTokenValidator.CreateConfigurationManager());
@@ -30,5 +35,17 @@ var host = new HostBuilder()
         services.AddSingleton<IRunDirectoryStore, AzureRunDirectoryStore>();
         services.AddSingleton<DirectoryAccessBroker>();
     })
+    .ConfigureLogging(logging =>
+    {
+        logging.AddFilter("DirectoryAccess.Functions", LogLevel.Information);
+        // Override the AI provider's default Warning filter for our categories only.
+        logging.AddFilter<ApplicationInsightsLoggerProvider>("DirectoryAccess.Functions", LogLevel.Information);
+    })
     .Build();
+var logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("DirectoryAccess.Functions.Startup");
+var insightsConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("APPLICATIONINSIGHTS_CONNECTION_STRING"));
+logger.LogInformation("Directory access worker started; Application Insights configured {InsightsConfigured}; expected issuer {Issuer}, audience {Audience}, repository ID {RepositoryId}, storage host {StorageHost}; adaptive sampling disabled",
+    insightsConfigured, BrokerOptions.Issuer, options.Audience, BrokerOptions.RepositoryId, options.StorageUrl.Host);
+if (!insightsConfigured)
+    logger.LogWarning("APPLICATIONINSIGHTS_CONNECTION_STRING is missing; configure it to send worker telemetry to Application Insights");
 host.Run();

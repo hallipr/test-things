@@ -12,6 +12,7 @@ namespace DirectoryAccess.Tests;
 public sealed class TokenValidationTests : IDisposable
 {
     private readonly RSA rsa = RSA.Create(2048);
+    private readonly RecordingLogger<GitHubTokenValidator> logs = new();
     private const string Audience = "api://test";
     private static BrokerOptions Options => new() { Audience = Audience, StorageUrl = new("https://test.dfs.core.windows.net") };
     private Dictionary<string, object> Claims() => new()
@@ -36,13 +37,18 @@ public sealed class TokenValidationTests : IDisposable
         {
             Issuer = BrokerOptions.Issuer,
             SigningKeys = { new RsaSecurityKey(rsa) { KeyId = "test-key" } }
-        }));
+        }), logs);
 
     [Fact]
     public async Task Valid_signed_identity_has_exact_run_claims()
     {
-        var identity = await Validator().ValidateAsync(Sign(JsonSerializer.Serialize(Claims())), default);
+        var token = Sign(JsonSerializer.Serialize(Claims()));
+        var identity = await Validator().ValidateAsync(token, default);
         Assert.Equal(new RunIdentity("1437763204", "123456789", "2"), identity);
+        Assert.Contains(logs.Entries, e => e.Message.Contains("lifetime checks passed"));
+        Assert.Contains(logs.Entries, e => e.Message.Contains("OIDC claim vetting"));
+        Assert.Contains(logs.Entries, e => e.Message.Contains("OIDC claims accepted"));
+        Assert.DoesNotContain(token, logs.Dump);
     }
 
     [Theory]
@@ -126,6 +132,7 @@ public sealed class TokenValidationTests : IDisposable
     {
         var claims = Claims(); claims["exp"] = DateTimeOffset.UtcNow.AddSeconds(-1).ToUnixTimeSeconds();
         await Assert.ThrowsAsync<InvalidTokenException>(() => Validator().ValidateAsync(Sign(JsonSerializer.Serialize(claims)), default));
+        Assert.Contains(logs.Entries, e => e.Message.Contains("SecurityTokenExpiredException"));
     }
 
     [Fact]

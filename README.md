@@ -57,6 +57,8 @@ Delegator on the HNS account. Separate non-HNS host storage receives the runtime
 and deployment roles. Both accounts disallow shared-key access and anonymous
 blobs. Public HTTPS endpoints are necessary for the GitHub-hosted runner.
 Hosting is Linux Flex Consumption, .NET 10 isolated.
+The sandbox parameters reuse the existing Application Insights component
+`rundirectory-d5eq7yh3lf7by`; `applicationInsightsName` is optional for other deployments.
 
 The local operator needs **Storage Blob Data Contributor** on the run-storage
 account (management-plane Contributor alone does not grant data access). Allow
@@ -131,6 +133,37 @@ invocation-to-run mapping remains necessary.
 
 See the [GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)
 for supported claims and customization options.
+
+## Function logs in Application Insights
+
+The isolated worker sends telemetry directly using
+`APPLICATIONINSIGHTS_CONNECTION_STRING`. Its own `Information` logs are enabled
+explicitly (the Insights provider defaults to `Warning`), independently of
+`host.json`. Host request/result logs are also enabled. Sampling is disabled for
+this low-volume POC so authorization stages are not randomly dropped.
+
+Logs cover discovery/key loading, signature/issuer/audience/lifetime checks,
+repository/run claim vetting, directory and mapping reads, individual mapping
+comparisons, delegation-key acquisition, SAS issuance and HTTP outcomes/timing.
+Rejections report the failed stage or exception type without raw exception text.
+SAS issuance logs include the directory URL **without its SAS query**, permissions
+and validity timestamps. JWTs, signatures, delegation-key values and SAS tokens
+are never logged by the Function.
+
+Open the component's **Logs** view and run:
+
+```kusto
+traces
+| where timestamp > ago(1h)
+| where tostring(customDimensions.CategoryName) startswith "DirectoryAccess.Functions"
+| project timestamp, severityLevel, message, operation_Id,
+    InvocationId=customDimensions.InvocationId, RunId=customDimensions.RunId,
+    FunctionInvocationId=customDimensions.FunctionInvocationId
+| order by timestamp asc
+```
+
+Use `operation_Id` to correlate a request with its storage dependencies and traces.
+Allow a few minutes for ingestion after deployment or invoking a new workflow.
 
 ## Limits
 

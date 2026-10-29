@@ -1,0 +1,139 @@
+name: Directory read authorization
+run-name: Directory read ${{ inputs.request_id || github.run_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Correlation ID supplied by the local upload script
+        required: false
+        type: string
+      expected_file:
+        description: Relative file pre-uploaded by operator inside the authorized directory
+        required: true
+        default: probe.txt
+        type: string
+      expected_sha256:
+        description: Optional SHA256 of expected_file, supplied by the upload script
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  directory-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BROKER_URL: ${{ vars.DIRECTORY_BROKER_URL }}
+      OIDC_AUDIENCE: ${{ vars.DIRECTORY_OIDC_AUDIENCE || 'api://hallipr-test-things-directory-access' }}
+      EXPECTED_FILE: ${{ inputs.expected_file }}
+      EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+    steps:
+      - name: Validate broker configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BROKER_URL" == https://*/api/directory-access ]] || { echo "Set DIRECTORY_BROKER_URL repository variable"; exit 1; }
+          echo "Operator must authorize directory: ${GITHUB_REPOSITORY_ID}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          echo "Waiting up to 10 minutes; this workflow cannot create authorization directories."
+      - name: Request OIDC grant and verify read/list and isolation
+        shell: python
+        run: |
+          import datetime, hashlib, json, os, pathlib, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
+
+          def request(url, method="GET", headers=None, data=None):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}, method=method), timeout=30) as r:
+                      return r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+
+          def mask(value):
+              # Workflow commands must not interpret CR/LF/% in externally supplied text.
+              value = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::add-mask::" + value, flush=True)
+
+          deadline = time.monotonic() + 600
+          grant = None
+          while time.monotonic() < deadline:
+              oidc_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote(os.environ["OIDC_AUDIENCE"], safe="")
+              status, body = request(oidc_url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+              if status != 200:
+                  raise SystemExit("OIDC request failed (no response body logged)")
+              token = json.loads(body)["value"]
+              mask(token)
+              status, body = request(os.environ["BROKER_URL"], method="POST", headers={"Authorization": "Bearer " + token}, data=b"")
+              if status == 200:
+                  grant = json.loads(body)
+                  mask(grant["sasToken"])
+                  break
+              if status not in (403, 502, 503):
+                  raise SystemExit(f"Broker rejected request: HTTP {status}")
+              print(f"Waiting for operator authorization / RBAC propagation (HTTP {status})", flush=True)
+              time.sleep(10)
+          if grant is None:
+              raise SystemExit("No authorization after 10 minutes")
+
+          base = grant["directoryUrl"]
+          sas = grant["sasToken"].lstrip("?")
+          q = urllib.parse.parse_qs(sas)
+          assert q["sr"] == ["d"] and q["sdd"] == ["3"] and q["sp"] == ["rl"] and q["spr"] == ["https"]
+          dt = lambda x: datetime.datetime.fromisoformat(x.replace("Z", "+00:00"))
+          assert (dt(q["se"][0]) - dt(q["st"][0])).total_seconds() == 3600
+          path = urllib.parse.urlsplit(base)
+          expected = f"/runs/{os.environ['GITHUB_REPOSITORY_ID']}/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}"
+          assert path.path == expected
+
+          # Recursive directory list through DFS; directory SAS covers descendants.
+          account_base = f"{path.scheme}://{path.netloc}/runs"
+          directory = path.path.removeprefix("/runs/")
+          headers = {"x-ms-version": "2023-11-03"}
+          paths, continuation, seen = [], "", set()
+          while True:
+              query = {"resource": "filesystem", "directory": directory, "recursive": "true"}
+              if continuation:
+                  query["continuation"] = continuation
+              url = account_base + "?" + urllib.parse.urlencode(query) + "&" + sas
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                  paths.extend(json.load(response)["paths"])
+                  continuation = response.headers.get("x-ms-continuation", "")
+              if not continuation:
+                  break
+              assert continuation not in seen, "Repeated listing continuation"
+              seen.add(continuation)
+          destination = pathlib.Path(tempfile.mkdtemp(prefix="run-input-", dir=os.environ["RUNNER_TEMP"]))
+          downloaded = 0
+          for entry in paths:
+              if str(entry.get("isDirectory", "")).lower() == "true":
+                  continue
+              name = entry["name"]
+              assert name.startswith(directory + "/"), "Listing escaped authorized directory"
+              relative = name[len(directory) + 1:]
+              assert all(p not in ("", ".", "..") for p in relative.split("/"))
+              target = destination.joinpath(*relative.split("/"))
+              target.parent.mkdir(parents=True, exist_ok=True)
+              status, content = request(base + "/" + urllib.parse.quote(relative, safe="/") + "?" + sas, headers=headers)
+              assert status == 200, f"Authorized file read failed: HTTP {status}"
+              target.write_bytes(content)
+              downloaded += 1
+          relative_file = os.environ["EXPECTED_FILE"]
+          assert relative_file and all(p not in ("", ".", "..") for p in relative_file.split("/"))
+          content = destination.joinpath(*relative_file.split("/")).read_bytes()
+          digest = hashlib.sha256(content).hexdigest()
+          if os.environ["EXPECTED_SHA256"]:
+              assert digest == os.environ["EXPECTED_SHA256"].lower(), "Uploaded content hash mismatch"
+          print(f"Consumed {downloaded} files in {destination}; {relative_file!r} SHA256 {digest}")
+          # Sibling attempt and sibling run read/list must be rejected, even when absent.
+          repo, run, attempt = directory.split("/")
+          for sibling in (f"{repo}/{run}/{int(attempt)+1}", f"{repo}/{int(run)+1}/{attempt}"):
+              status, _ = request(account_base + "/" + sibling + "/" + urllib.parse.quote(relative_file, safe="/") + "?" + sas, headers=headers)
+              assert status == 403, f"Sibling read was not denied: HTTP {status}"
+              query = urllib.parse.urlencode({"resource": "filesystem", "directory": sibling, "recursive": "true"})
+              status, _ = request(account_base + "?" + query + "&" + sas, headers=headers)
+              assert status == 403, f"Sibling list was not denied: HTTP {status}"
+          # Random name avoids modifying a preexisting object if a regression permits write.
+          status, _ = request(base + "/forbidden-write-" + uuid.uuid4().hex + "?resource=file&" + sas, method="PUT", headers=headers, data=b"")
+          assert status == 403, f"Write was not denied: HTTP {status}"
+          print("PASS: directory list + file read, sibling attempt/run read/list denied, write denied; exact 60-minute directory SAS.")

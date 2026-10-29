@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/TestResults/
+**/local.settings.json
+.vs/
+.azure/.preview-temp/
+infra/main.json
+*.user
+publish/
+function.zip

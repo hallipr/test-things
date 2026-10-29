@@ -42,7 +42,7 @@ jobs:
       - name: Request OIDC grant and verify read/list and isolation
         shell: python
         run: |
-          import datetime, hashlib, json, os, pathlib, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
+          import base64, datetime, hashlib, json, os, pathlib, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
 
           def request(url, method="GET", headers=None, data=None):
               try:
@@ -56,12 +56,21 @@ jobs:
               value = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print("::add-mask::" + value, flush=True)
 
+          def dump_oidc_claims(token):
+              header, payload, _ = token.split(".")
+              for label, segment in (("header", header), ("payload", payload)):
+                  decoded = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+                  print(f"::group::GitHub OIDC {label} (decoded, unverified; signature omitted)", flush=True)
+                  print(json.dumps(decoded, indent=2, sort_keys=True), flush=True)
+                  print("::endgroup::", flush=True)
+
           invocation = os.environ["INVOCATION_ID"]
           assert invocation.isascii() and invocation.isdecimal() and invocation == str(int(invocation))
           assert 1 <= int(invocation) <= 9223372036854775807
           broker = os.environ["BROKER_URL"].rstrip("/") + "/"
           deadline = time.monotonic() + 600
           grant = None
+          claims_dumped = False
           while time.monotonic() < deadline:
               oidc_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote(os.environ["OIDC_AUDIENCE"], safe="")
               status, body = request(oidc_url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
@@ -69,6 +78,9 @@ jobs:
                   raise SystemExit("OIDC request failed (no response body logged)")
               token = json.loads(body)["value"]
               mask(token)
+              if not claims_dumped:
+                  dump_oidc_claims(token)
+                  claims_dumped = True
               status, body = request(broker + invocation, method="POST", headers={"Authorization": "Bearer " + token}, data=b"")
               if status == 200:
                   grant = json.loads(body)

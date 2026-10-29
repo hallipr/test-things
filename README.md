@@ -107,6 +107,26 @@ Azure Functions Core Tools and host storage/Azurite are additionally required.
 `Development` explicitly allows developer Azure credentials; production requires
 `AZURE_CLIENT_ID` and uses only that user-assigned managed identity.
 
+## Inspecting OIDC claims
+
+The workflow logs the first token's decoded header and complete payload in
+separate expandable groups. It never logs the signature or full bearer token.
+These diagnostic values are unverified locally; the Function still verifies the
+JWT before authorizing access. Claims expose repository/run/actor metadata to
+anyone who can read the Actions logs.
+
+GitHub permits a custom `aud` (already configured here), repository/organization
+`sub` templates built from supported claims, and workflow-context choices such as
+ref, environment and reusable workflow. Organization/enterprise administrators
+can also include repository custom properties as `repo_property_*` claims.
+Arbitrary workflow inputs do not become custom signed claims, and jobs cannot
+choose their `run_id`, `run_attempt` or `repository_id`. A job-selected audience
+or context is not independent authorization for an invocation: the operator's
+invocation-to-run mapping remains necessary.
+
+See the [GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)
+for supported claims and customization options.
+
 ## Limits
 
 - The SAS is a bearer credential: do not log it or store it in artifacts. Workflow

@@ -39,10 +39,10 @@ public sealed class TokenValidationTests : IDisposable
         }));
 
     [Fact]
-    public async Task Valid_signed_identity_has_exact_path()
+    public async Task Valid_signed_identity_has_exact_run_claims()
     {
         var identity = await Validator().ValidateAsync(Sign(JsonSerializer.Serialize(Claims())), default);
-        Assert.Equal("1437763204/123456789/2", identity.DirectoryPath);
+        Assert.Equal(new RunIdentity("1437763204", "123456789", "2"), identity);
     }
 
     [Theory]

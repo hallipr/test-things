@@ -1,11 +1,11 @@
 name: Directory read authorization
-run-name: Directory read ${{ inputs.request_id || github.run_id }}
+run-name: Invocation ${{ inputs.invocation_id }}
 on:
   workflow_dispatch:
     inputs:
-      request_id:
-        description: Correlation ID supplied by the local upload script
-        required: false
+      invocation_id:
+        description: Invocation staged by the operator; requires an independently written run mapping
+        required: true
         type: string
       expected_file:
         description: Relative file pre-uploaded by operator inside the authorized directory
@@ -30,14 +30,15 @@ jobs:
       OIDC_AUDIENCE: ${{ vars.DIRECTORY_OIDC_AUDIENCE || 'api://hallipr-test-things-directory-access' }}
       EXPECTED_FILE: ${{ inputs.expected_file }}
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+      INVOCATION_ID: ${{ inputs.invocation_id }}
     steps:
       - name: Validate broker configuration
         shell: bash
         run: |
           set -euo pipefail
           [[ "$BROKER_URL" == https://*/api/directory-access ]] || { echo "Set DIRECTORY_BROKER_URL repository variable"; exit 1; }
-          echo "Operator must authorize directory: ${GITHUB_REPOSITORY_ID}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
-          echo "Waiting up to 10 minutes; this workflow cannot create authorization directories."
+          echo "Run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT} requires an operator-written invocation mapping."
+          echo "Waiting up to 10 minutes; this workflow cannot write authorization blobs."
       - name: Request OIDC grant and verify read/list and isolation
         shell: python
         run: |
@@ -55,6 +56,10 @@ jobs:
               value = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print("::add-mask::" + value, flush=True)
 
+          invocation = os.environ["INVOCATION_ID"]
+          assert invocation.isascii() and invocation.isdecimal() and invocation == str(int(invocation))
+          assert 1 <= int(invocation) <= 9223372036854775807
+          broker = os.environ["BROKER_URL"].rstrip("/") + "/"
           deadline = time.monotonic() + 600
           grant = None
           while time.monotonic() < deadline:
@@ -64,7 +69,7 @@ jobs:
                   raise SystemExit("OIDC request failed (no response body logged)")
               token = json.loads(body)["value"]
               mask(token)
-              status, body = request(os.environ["BROKER_URL"], method="POST", headers={"Authorization": "Bearer " + token}, data=b"")
+              status, body = request(broker + invocation, method="POST", headers={"Authorization": "Bearer " + token}, data=b"")
               if status == 200:
                   grant = json.loads(body)
                   mask(grant["sasToken"])
@@ -79,12 +84,21 @@ jobs:
           base = grant["directoryUrl"]
           sas = grant["sasToken"].lstrip("?")
           q = urllib.parse.parse_qs(sas)
-          assert q["sr"] == ["d"] and q["sdd"] == ["3"] and q["sp"] == ["rl"] and q["spr"] == ["https"]
+          assert q["sr"] == ["d"] and q["sdd"] == ["1"] and q["sp"] == ["rl"] and q["spr"] == ["https"]
           dt = lambda x: datetime.datetime.fromisoformat(x.replace("Z", "+00:00"))
           assert (dt(q["se"][0]) - dt(q["st"][0])).total_seconds() == 3600
           path = urllib.parse.urlsplit(base)
-          expected = f"/runs/{os.environ['GITHUB_REPOSITORY_ID']}/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}"
+          expected = f"/runs/{invocation}"
           assert path.path == expected
+          for other in {"1", str(int(invocation) + 1)} - {invocation}:
+              status, _ = request(broker + other, method="POST", headers={"Authorization": "Bearer " + token}, data=b"")
+              assert status == 403, f"Broker accepted another invocation ID: HTTP {status}"
+          status, mapping = request(base + "/.authorization.json?" + sas)
+          assert status == 200
+          assert json.loads(mapping) == {
+              "invocationId": invocation, "repositoryId": os.environ["GITHUB_REPOSITORY_ID"],
+              "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"]
+          }
 
           # Recursive directory list through DFS; directory SAS covers descendants.
           account_base = f"{path.scheme}://{path.netloc}/runs"
@@ -111,6 +125,8 @@ jobs:
               name = entry["name"]
               assert name.startswith(directory + "/"), "Listing escaped authorized directory"
               relative = name[len(directory) + 1:]
+              if relative == ".authorization.json":
+                  continue
               assert all(p not in ("", ".", "..") for p in relative.split("/"))
               target = destination.joinpath(*relative.split("/"))
               target.parent.mkdir(parents=True, exist_ok=True)
@@ -125,9 +141,8 @@ jobs:
           if os.environ["EXPECTED_SHA256"]:
               assert digest == os.environ["EXPECTED_SHA256"].lower(), "Uploaded content hash mismatch"
           print(f"Consumed {downloaded} files in {destination}; {relative_file!r} SHA256 {digest}")
-          # Sibling attempt and sibling run read/list must be rejected, even when absent.
-          repo, run, attempt = directory.split("/")
-          for sibling in (f"{repo}/{run}/{int(attempt)+1}", f"{repo}/{int(run)+1}/{attempt}"):
+          # A directory grant must not expose another invocation or the allocator.
+          for sibling in (str(int(invocation) + 1), "_control"):
               status, _ = request(account_base + "/" + sibling + "/" + urllib.parse.quote(relative_file, safe="/") + "?" + sas, headers=headers)
               assert status == 403, f"Sibling read was not denied: HTTP {status}"
               query = urllib.parse.urlencode({"resource": "filesystem", "directory": sibling, "recursive": "true"})
@@ -136,4 +151,4 @@ jobs:
           # Random name avoids modifying a preexisting object if a regression permits write.
           status, _ = request(base + "/forbidden-write-" + uuid.uuid4().hex + "?resource=file&" + sas, method="PUT", headers=headers, data=b"")
           assert status == 403, f"Write was not denied: HTTP {status}"
-          print("PASS: directory list + file read, sibling attempt/run read/list denied, write denied; exact 60-minute directory SAS.")
+          print("PASS: trusted invocation-to-run mapping, arbitrary invocation rejected, sibling/control read/list denied, write denied; exact 60-minute directory SAS.")

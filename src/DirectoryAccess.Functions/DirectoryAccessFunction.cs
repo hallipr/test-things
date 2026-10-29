@@ -11,11 +11,12 @@ public sealed class DirectoryAccessFunction(DirectoryAccessBroker broker, ILogge
 {
     [Function("DirectoryAccess")]
     public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "directory-access")] HttpRequestData request,
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "directory-access/{invocationId}")] HttpRequestData request,
+        string invocationId,
         CancellationToken cancellationToken)
     {
         // The trigger is anonymous only at the Functions key layer. Workload JWT
-        // validation below is mandatory; no body/query input influences authority.
+        // validation and the operator-written invocation mapping are mandatory.
         var response = request.CreateResponse();
         response.Headers.Add("Cache-Control", "no-store");
         response.Headers.Add("Pragma", "no-cache");
@@ -28,7 +29,7 @@ public sealed class DirectoryAccessFunction(DirectoryAccessBroker broker, ILogge
             if (values.Length != 1 || !values[0].StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidTokenException();
             var token = values[0][7..];
-            var grant = await broker.IssueAsync(token, cancellationToken);
+            var grant = await broker.IssueAsync(token, invocationId, cancellationToken);
             response.StatusCode = HttpStatusCode.OK;
             await response.WriteStringAsync(System.Text.Json.JsonSerializer.Serialize(grant,
                 new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)));
@@ -44,6 +45,7 @@ public sealed class DirectoryAccessFunction(DirectoryAccessBroker broker, ILogge
         }
         catch (HttpRequestException) { await Error(response, HttpStatusCode.ServiceUnavailable, "upstream_unavailable"); }
         catch (AuthenticationFailedException) { await Error(response, HttpStatusCode.ServiceUnavailable, "storage_identity_unavailable"); }
+        catch (IOException) { await Error(response, HttpStatusCode.ServiceUnavailable, "storage_read_failure"); }
         return response;
     }
 

@@ -6,6 +6,7 @@ public sealed record BrokerOptions
     public const string Repository = "hallipr/test-things";
     public const string RepositoryId = "1437763204";
     public const string FileSystem = "runs";
+    public const string AuthorizationFile = ".authorization.json";
     public required string Audience { get; init; }
     public required Uri StorageUrl { get; init; }
 
@@ -26,10 +27,9 @@ public sealed class InvalidTokenException : Exception;
 public sealed class ForbiddenException : Exception;
 public sealed class UpstreamException : Exception;
 
-public sealed record RunIdentity(string RepositoryId, string RunId, string RunAttempt)
-{
-    public string DirectoryPath => $"{RepositoryId}/{RunId}/{RunAttempt}";
-}
+public sealed record RunIdentity(string RepositoryId, string RunId, string RunAttempt);
+
+public sealed record InvocationAuthorization(string InvocationId, RunIdentity Run);
 
 // Keep credentials out of generated record ToString() output.
 public sealed class DirectoryGrant

@@ -162,7 +162,7 @@ traces
 | order by timestamp asc
 ```
 
-Use `operation_Id` to correlate a request with its storage dependencies and traces.
+Use `operation_Id` to correlate each HTTP request with its authorization traces.
 Allow a few minutes for ingestion after deployment or invoking a new workflow.
 
 ## Limits

@@ -42,7 +42,7 @@ jobs:
       - name: Request OIDC grant and verify read/list and isolation
         shell: python
         run: |
-          import base64, datetime, hashlib, json, os, pathlib, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
+          import base64, datetime, hashlib, json, os, pathlib, shlex, subprocess, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
 
           def request(url, method="GET", headers=None, data=None):
               try:
@@ -153,6 +153,58 @@ jobs:
           if os.environ["EXPECTED_SHA256"]:
               assert digest == os.environ["EXPECTED_SHA256"].lower(), "Uploaded content hash mismatch"
           print(f"Consumed {downloaded} files in {destination}; {relative_file!r} SHA256 {digest}")
+
+          cli_environment = os.environ.copy()
+          for key in ("AZURE_STORAGE_KEY", "AZURE_STORAGE_CONNECTION_STRING", "AZURE_STORAGE_SERVICE_ENDPOINT"):
+              cli_environment.pop(key, None)
+          cli_environment["AZURE_STORAGE_SAS_TOKEN"] = sas
+          account = path.hostname.split(".", 1)[0]
+          cli_options = ["--account-name", account, "--file-system", "runs", "--auth-mode", "key", "--output", "json"]
+
+          def run_az(arguments):
+              command = ["az", "storage", "fs", "file"] + arguments + cli_options
+              print("$ AZURE_STORAGE_SAS_TOKEN=<masked> " + shlex.join(command), flush=True)
+              result = subprocess.run(command, env=cli_environment, capture_output=True, text=True)
+              if result.stdout:
+                  print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+              if result.stderr:
+                  print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", flush=True)
+              if result.returncode:
+                  raise SystemExit(f"Azure CLI failed with exit code {result.returncode}")
+              return result.stdout
+
+          print("::group::Azure CLI directory contents and largest blob download", flush=True)
+          cli_paths, marker, seen_markers = [], "", set()
+          while True:
+              arguments = ["list", "--path", directory, "--recursive", "true", "--num-results", "5000", "--show-next-marker"]
+              if marker:
+                  arguments += ["--marker", marker]
+              page = json.loads(run_az(arguments))
+              assert isinstance(page, list), "Unexpected Azure CLI listing shape"
+              cli_paths.extend(item for item in page if "name" in item)
+              markers = [item["nextMarker"] for item in page if "nextMarker" in item]
+              assert len(markers) <= 1, "Ambiguous Azure CLI continuation"
+              marker = markers[0] if markers else ""
+              if not marker:
+                  break
+              assert marker not in seen_markers, "Repeated Azure CLI continuation"
+              seen_markers.add(marker)
+          assert {item["name"] for item in cli_paths} == {item["name"] for item in paths}, "CLI listing differs from REST listing"
+          files = [item for item in cli_paths if str(item.get("isDirectory", "")).lower() != "true"]
+          assert files, "No blobs available to download"
+          largest = max(files, key=lambda item: (int(item["contentLength"]), item["name"]))
+          assert largest["name"].startswith(directory + "/"), "Largest blob escaped invocation directory"
+          print(f"Largest blob (including authorization metadata): {largest['name']!r}, {largest['contentLength']} bytes", flush=True)
+          cli_destination = pathlib.Path(tempfile.mkdtemp(prefix="az-largest-", dir=os.environ["RUNNER_TEMP"])) / "downloaded-blob"
+          run_az(["download", "--path", largest["name"], "--destination", str(cli_destination), "--overwrite", "false"])
+          cli_content = cli_destination.read_bytes()
+          assert len(cli_content) == int(largest["contentLength"]), "Azure CLI download size mismatch"
+          relative_largest = largest["name"][len(directory) + 1:]
+          expected_content = mapping if relative_largest == ".authorization.json" else destination.joinpath(*relative_largest.split("/")).read_bytes()
+          assert cli_content == expected_content, "Azure CLI download differs from REST content"
+          print(f"Azure CLI downloaded {len(cli_content)} bytes to {cli_destination}; SHA256 {hashlib.sha256(cli_content).hexdigest()}", flush=True)
+          print("::endgroup::", flush=True)
+
           # A directory grant must not expose another invocation or the allocator.
           for sibling in (str(int(invocation) + 1), "_control"):
               status, _ = request(account_base + "/" + sibling + "/" + urllib.parse.quote(relative_file, safe="/") + "?" + sas, headers=headers)

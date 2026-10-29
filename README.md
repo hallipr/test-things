@@ -81,6 +81,11 @@ The workflow waits up to ten minutes, downloads the directory into runner
 temporary storage (including paginated listings), checks a supplied file's SHA256,
 and verifies that arbitrary invocation requests, sibling/control reads and lists,
 and writes fail. The authorization blob is checked but excluded from input files.
+It also uses Azure CLI with the issued SAS (no Azure login) to log a complete,
+paginated directory listing and download the largest blob, including authorization
+metadata when it is largest. CLI commands, stdout/stderr, selected blob size, local
+download path and SHA256 are logged; the SAS stays masked. The download's bytes
+are compared with the REST read, without dumping arbitrary file contents.
 The script
 waits for the workflow result and fails if it fails. Symlinks/junctions and empty
 inputs are rejected. Only upload data intended for that workflow.
